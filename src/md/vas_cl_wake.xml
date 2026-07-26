@@ -4,7 +4,8 @@
     CL scan/pursuit heartbeat.
     Signals sectors with the 'vas_cl_wake' param; consumer aiscript injections and the CL pursuit
     handler key off that signal. Consumers register their desired heartbeat interval in
-    global.$vas_cl_wake_intervals.{'<consumer id>'}; the densest (minimum) registered interval sizes
+    global.$vas_cl_wake_intervals.{'$<consumer id>'} - note the leading '$', table string keys need it;
+    the densest (minimum) registered interval sizes
     the buckets. Per-consumer scan cadence is throttled consumer-side, so a denser heartbeat only
     costs extra interrupt wakeups, never extra scans.
     Sectors are split into buckets so the mod does not signal every sector on the same second.

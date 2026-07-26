@@ -35,8 +35,10 @@ as return values. Consumer mods register themselves through globals:
 
 - `global.$vas_cl_combat_order_ids` - append your order id so your ships count as
   potential combatants in other consumers' force calculations.
-- `global.$vas_cl_wake_intervals.{'<your mod id>'}` - register your desired
+- `global.$vas_cl_wake_intervals.{'$<your mod id>'}` - register your desired
   heartbeat interval; sectors are signalled with the `'vas_cl_wake'` param.
+  Mind the leading `$` inside the key string - MD table string keys require it,
+  and the write silently errors out without it.
 
 ## Credits
 
