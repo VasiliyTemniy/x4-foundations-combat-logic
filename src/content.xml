@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<content
+  id="vas_combat_logic"
+  name="[VAS] Combat Logic"
+  description="Shared combat logic base for VAS mods: sector scan and force evaluation engine, attack issuing helpers, wake heartbeat. Does nothing on its own - install it as a dependency of mods that use it."
+  author="VasiliyTemniy"
+  version="100"
+  date="2026-07-10"
+  save="0">
+</content>

@@ -1,0 +1,362 @@
+<?xml version="1.0" encoding="utf-8"?>
+<aiscript name="lib.vas.cl.issue.attack"
+  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="aiscripts.xsd">
+  <params>
+    <param name="primary_target" comment="Selected primary target that must be attacked. Make sure that this value is not null - outside of this aiscript"/>
+    <param name="secondary_targets" default="null" comment="Secondary targets list must be provided for ships only, stations must be attacked one by one"/>
+    <param name="blocking_stations" default="null" comment="Stations detected on the route to the selected target; used for approach path orders"/>
+    <param name="sector_enemy_stations" default="null" comment="All valid enemy stations in the selected target sector; used for approach path validation"/>
+    <param name="pursue_distance" comment="Forwarded to the Attack order. Travelled-distance pursuit budget used by CL pursuit clamping - NOT vanilla straight-line pursuedistance semantics"/>
+    <param name="skip_ship_mayattack" default="false" comment="Bypass vanilla mayattack / fire-authorization checks for hostile SHIP targets, so unarmed civilian and economy ships can be engaged too"/>
+    <param name="skip_station_mayattack" default="true" comment="Same bypass for hostile STATION targets, so civilian and economy stations can be assaulted"/>
+    <param name="approach_max_waypoints" default="4" comment="Max detour waypoints planned around blocking stations on the approach route; 0 disables waypoint construction entirely"/>
+    <param name="approach_fleet_clearance_min" default="20km" comment="Base clearance kept between the fleet and a station's bounds when planning detours; fleet size adds on top of this"/>
+    <param name="approach_fleet_clearance_max" default="40km" comment="Upper cap for the fleet-size-adjusted clearance"/>
+    <param name="approach_fleet_clearance_per_ship" default="1km" comment="Clearance added per ship of this ship's VFF branch, so broad formations detour wider; capped by approach_fleet_clearance_max"/>
+    <param name="approach_route_corridor" default="10km" comment="Corridor radius around each route leg; a station whose bounds intrude into the corridor blocks the leg (invalidates a candidate waypoint or becomes a blocker to detour around)"/>
+    <param name="approach_initial_start_margin" default="10km" comment="On the first route leg only, stations projecting closer than this to the ship's start position are ignored as blockers - the ship is already next to them and can simply fly away"/>
+    <param name="debugchance" default="0"/>
+  </params>
+
+  <attention min="unknown">
+    <actions>
+      <create_order id="'Attack'" object="this.ship" immediate="true">
+        <param name="primarytarget" value="$primary_target"/>
+        <param name="secondarytargets" value="$secondary_targets"/>
+        <param name="allowothertargets" value="false"/>
+        <param name="pursuetargets" value="true"/>
+        <param name="pursuedistance" value="$pursue_distance"/>
+        <param name="vas_cl_issued_by_cl" value="true"/>
+        <param name="vas_cl_skip_ship_mayattack" value="$skip_ship_mayattack"/>
+        <param name="vas_cl_skip_station_mayattack" value="$skip_station_mayattack"/>
+        <param name="checkrelation" value="false"/>
+        <param name="internalorder" value="true"/>
+      </create_order>
+
+      <!-- If the enemy is in sight - just attack it. -->
+      <do_if value="this.ship.cansee.{$primary_target}">
+        <!-- Wait to make sure no "ACHTUNG! INFINITE LOOP DETECTED" errors are produced -->
+        <wait min="1ms" max="2ms"/>
+        <return/>
+      </do_if>
+
+      <!-- Target not currently visible; plan a physical approach. -->
+
+      <!-- Plan fixed detour waypoints around stations on the straight route.
+           The VFF branch cache was refreshed by the scan that called this helper. GC only removes
+           entries after they have been expired for more than 3 seconds, so using it here as the
+           current friendly fleet size is intentional. -->
+      <set_value name="$approach_waypoints" exact="[]"/>
+      <set_value name="$approach_max_waypoints" exact="$approach_max_waypoints"/>
+
+      <!-- Skip waypoint construction if no waypoints are allowed or no enemy stations are present -->
+      <do_if value="$approach_max_waypoints == 0
+            or not (@$sector_enemy_stations and $sector_enemy_stations.count gt 0)
+            or not (@$blocking_stations and $blocking_stations.count gt 0)">
+        <create_position name="$approach_current_pos" space="this.ship.sector" object="this.ship"/>
+        <resume label="skip_waypoints_construction"/>
+      </do_if>
+
+      <!-- Fleet size is used to adjust clearance required between the fleet and blocker station -->
+      <set_value name="$approach_fleet_size" exact="1"/>
+      <do_if value="@global.$vas_cl_vffbranch_cache.{this.ship.owner}.{this.ship}.$value">
+        <set_value name="$approach_fleet_size" exact="global.$vas_cl_vffbranch_cache.{this.ship.owner}.{this.ship}.$value.count"/>
+      </do_if>
+
+      <!-- Keep at least approach_fleet_clearance_min from station bounds; larger fleets get wider clearance
+           so broad formations have a better chance of passing cleanly. -->
+      <set_value name="$approach_fleet_clearance" exact="[$approach_fleet_clearance_min + $approach_fleet_size * $approach_fleet_clearance_per_ship, $approach_fleet_clearance_max].min"/>
+      <set_value name="$approach_route_corridor" exact="$approach_route_corridor"/>
+      <set_value name="$approach_initial_start_margin" exact="$approach_initial_start_margin"/>
+      <set_value name="$approach_route_failed" exact="false"/>
+
+      <create_position name="$approach_current_pos" space="this.ship.sector" object="this.ship"/>
+      <create_position name="$approach_target_pos" space="this.ship.sector" object="$primary_target"/>
+      <set_value name="$approach_current_blockers" exact="$blocking_stations"/>
+
+      <do_while value="$approach_waypoints.count lt $approach_max_waypoints">
+        <set_value name="$approach_blocker" exact="$approach_current_blockers.{1}"/>
+        <create_position name="$approach_blocker_pos" space="this.ship.sector" object="$approach_blocker"/>
+        <set_value name="$approach_clearance" exact="$approach_fleet_clearance + ($approach_blocker.size / 2.0)"/>
+        <set_value name="$approach_waypoint_found" exact="false"/>
+
+        <!-- Perpendicular basis (up/right) for candidate directions around the blocker, built from
+             the current_pos -> blocker_pos axis. "up" is the axis-perpendicular direction closest to
+             world-Y (X4 is Y-up; the ecliptic is the X/Z plane, so a vertical detour clears
+             stations most reliably); "right" completes the basis via cross product. -->
+        <set_value name="$approach_axis_x" exact="$approach_blocker_pos.x - $approach_current_pos.x"/>
+        <set_value name="$approach_axis_y" exact="$approach_blocker_pos.y - $approach_current_pos.y"/>
+        <set_value name="$approach_axis_z" exact="$approach_blocker_pos.z - $approach_current_pos.z"/>
+        <set_value name="$approach_axis_len" exact="[$approach_blocker_pos.distanceto.{$approach_current_pos}, 1m].max"/>
+        <set_value name="$approach_ax" exact="$approach_axis_x / $approach_axis_len"/>
+        <set_value name="$approach_ay" exact="$approach_axis_y / $approach_axis_len"/>
+        <set_value name="$approach_az" exact="$approach_axis_z / $approach_axis_len"/>
+
+        <!-- Gram-Schmidt projection of world-Y onto the plane perpendicular to the axis. -->
+        <set_value name="$approach_up_raw_x" exact="0 - ($approach_ax * $approach_ay)"/>
+        <set_value name="$approach_up_raw_y" exact="1 - ($approach_ay * $approach_ay)"/>
+        <set_value name="$approach_up_raw_z" exact="0 - ($approach_az * $approach_ay)"/>
+        <set_value name="$approach_up_raw_len_sq" exact="$approach_up_raw_x * $approach_up_raw_x + $approach_up_raw_y * $approach_up_raw_y + $approach_up_raw_z * $approach_up_raw_z"/>
+
+        <!-- Degenerate when the axis is near-vertical (world-Y projection collapses to ~0); fall
+             back to world X/Z, which are equally valid lateral directions in that case. -->
+        <do_if value="$approach_up_raw_len_sq lt 0.000001">
+          <set_value name="$approach_up_x" exact="1"/>
+          <set_value name="$approach_up_y" exact="0"/>
+          <set_value name="$approach_up_z" exact="0"/>
+          <set_value name="$approach_right_x" exact="0"/>
+          <set_value name="$approach_right_y" exact="0"/>
+          <set_value name="$approach_right_z" exact="1"/>
+        </do_if>
+        <do_else>
+          <set_value name="$approach_up_raw_len" exact="sqrt($approach_up_raw_len_sq)"/>
+          <set_value name="$approach_up_x" exact="$approach_up_raw_x / $approach_up_raw_len"/>
+          <set_value name="$approach_up_y" exact="$approach_up_raw_y / $approach_up_raw_len"/>
+          <set_value name="$approach_up_z" exact="$approach_up_raw_z / $approach_up_raw_len"/>
+          <set_value name="$approach_right_x" exact="$approach_ay * $approach_up_z - $approach_az * $approach_up_y"/>
+          <set_value name="$approach_right_y" exact="$approach_az * $approach_up_x - $approach_ax * $approach_up_z"/>
+          <set_value name="$approach_right_z" exact="$approach_ax * $approach_up_y - $approach_ay * $approach_up_x"/>
+        </do_else>
+
+        <!-- 8 candidates on the cone's base circle around the blocker: cardinal directions
+             (+up, -up, +right, -right) at 1x clearance, then diagonals at 2x clearance. First one
+             that clears all sector enemy stations is accepted. -->
+        <do_all exact="8" counter="$approach_dir_i">
+          <set_value name="$approach_mult_up" exact="if $approach_dir_i == 1 then 1
+                                                         else if $approach_dir_i == 2 then -1
+                                                         else if $approach_dir_i == 3 then 0
+                                                         else if $approach_dir_i == 4 then 0
+                                                         else if $approach_dir_i == 5 then 1
+                                                         else if $approach_dir_i == 6 then -1
+                                                         else if $approach_dir_i == 7 then -1
+                                                         else 1"/>
+          <set_value name="$approach_mult_right" exact="if $approach_dir_i == 1 then 0
+                                                            else if $approach_dir_i == 2 then 0
+                                                            else if $approach_dir_i == 3 then 1
+                                                            else if $approach_dir_i == 4 then -1
+                                                            else if $approach_dir_i == 5 then 1
+                                                            else if $approach_dir_i == 6 then 1
+                                                            else if $approach_dir_i == 7 then -1
+                                                            else -1"/>
+          <set_value name="$approach_mult_dir_radius" exact="if $approach_dir_i le 4 then $approach_clearance else $approach_clearance * sqrt(2)"/>
+
+          <create_position name="$approach_candidate_waypoint" space="this.ship.sector"
+                           x="$approach_blocker_pos.x + (($approach_up_x * $approach_mult_up + $approach_right_x * $approach_mult_right) * $approach_mult_dir_radius)"
+                           y="$approach_blocker_pos.y + (($approach_up_y * $approach_mult_up + $approach_right_y * $approach_mult_right) * $approach_mult_dir_radius)"
+                           z="$approach_blocker_pos.z + (($approach_up_z * $approach_mult_up + $approach_right_z * $approach_mult_right) * $approach_mult_dir_radius)"/>
+
+          <!-- Candidate waypoints are validated against all sector enemy stations, not only the
+               originally blocking stations, because the detour can create new station conflicts. -->
+          <set_value name="$approach_candidate_valid" exact="true"/>
+          <set_value name="$approach_dx" exact="$approach_candidate_waypoint.x - $approach_current_pos.x"/>
+          <set_value name="$approach_dy" exact="$approach_candidate_waypoint.y - $approach_current_pos.y"/>
+          <set_value name="$approach_dz" exact="$approach_candidate_waypoint.z - $approach_current_pos.z"/>
+          <set_value name="$approach_line_len" exact="[$approach_current_pos.distanceto.{$approach_candidate_waypoint}, 1m].max"/>
+          <set_value name="$approach_line_len_sq" exact="$approach_line_len * $approach_line_len"/>
+
+          <do_all exact="$sector_enemy_stations.count" counter="$approach_station_i">
+            <set_value name="$approach_station" exact="$sector_enemy_stations.{$approach_station_i}"/>
+            <!-- No sense to check the primary target -->
+            <do_if value="$approach_station == $primary_target">
+              <continue/>
+            </do_if>
+
+            <!-- No sense to check the blocker that's currently being processed -->
+            <do_if value="$approach_station == $approach_blocker">
+              <continue/>
+            </do_if>
+
+            <!-- Endpoint clearance: the waypoint itself must stay far enough from station bounds. -->
+            <set_value name="$approach_waypoint_clearance_radius" exact="$approach_fleet_clearance + ($approach_station.size / 2.0)"/>
+
+            <!-- Early cheap prefilter: skip stations that are out of the route leg bubble -
+                 they cannot affect this waypoint in any case -->
+            <do_if value="$approach_station.distanceto.{$approach_current_pos} gt ($approach_line_len + $approach_waypoint_clearance_radius)">
+              <continue/>
+            </do_if>
+
+            <!-- First reject waypoint points that are themselves too close to any sector station.
+                 Segment projection below can intentionally ignore endpoint-adjacent stations, but
+                 that must not allow a waypoint to be placed inside a station's clearance bubble. -->
+            <do_if value="$approach_station.distanceto.{$approach_candidate_waypoint} le $approach_waypoint_clearance_radius">
+              <set_value name="$approach_candidate_valid" exact="false"/>
+              <break/>
+            </do_if>
+
+            <create_position name="$approach_station_pos" space="this.ship.sector" object="$approach_station"/>
+
+            <set_value name="$approach_bx" exact="$approach_station_pos.x - $approach_current_pos.x"/>
+            <set_value name="$approach_by" exact="$approach_station_pos.y - $approach_current_pos.y"/>
+            <set_value name="$approach_bz" exact="$approach_station_pos.z - $approach_current_pos.z"/>
+            <set_value name="$approach_dot" exact="$approach_bx * $approach_dx + $approach_by * $approach_dy + $approach_bz * $approach_dz"/>
+
+            <!-- Projection must fall on the route segment, not behind current_pos or past the candidate waypoint. -->
+            <do_if value="$approach_dot le 0 or $approach_dot gt $approach_line_len_sq">
+              <continue/>
+            </do_if>
+
+            <!-- On the first leg, ignore blockers too close to the ship start; only mid-route blockers matter there. -->
+            <do_if value="$approach_waypoints.count == 0">
+              <set_value name="$approach_projection_distance" exact="$approach_dot / $approach_line_len"/>
+              <do_if value="$approach_projection_distance lt $approach_initial_start_margin">
+                <continue/>
+              </do_if>
+            </do_if>
+
+            <!-- Route corridor: the leg line itself must not pass through station bounds. -->
+            <set_value name="$approach_route_corridor_radius" exact="$approach_route_corridor + ($approach_station.size / 2.0)"/>
+            <set_value name="$approach_route_corridor_radius_sq" exact="$approach_route_corridor_radius * $approach_route_corridor_radius"/>
+            <set_value name="$approach_station_dist_sq" exact="$approach_bx * $approach_bx + $approach_by * $approach_by + $approach_bz * $approach_bz"/>
+            <set_value name="$approach_perp_dist_sq" exact="$approach_station_dist_sq - (($approach_dot * $approach_dot) / $approach_line_len_sq)"/>
+
+            <!-- Perpendicular distance (normale) to route line must fit inside the corridor; one hit invalidates the whole candidate. -->
+            <do_if value="$approach_perp_dist_sq le $approach_route_corridor_radius_sq">
+              <set_value name="$approach_candidate_valid" exact="false"/>
+              <break/>
+            </do_if>
+          </do_all>
+
+          <!-- Candidate cleared every station; accept it and stop trying the remaining 8 directions. -->
+          <do_if value="$approach_candidate_valid">
+            <append_to_list name="$approach_waypoints" exact="$approach_candidate_waypoint"/>
+            <set_value name="$approach_current_pos" exact="$approach_candidate_waypoint"/>
+            <set_value name="$approach_waypoint_found" exact="true"/>
+            <break/>
+          </do_if>
+        </do_all>
+
+        <do_if value="not $approach_waypoint_found">
+          <set_value name="$approach_route_failed" exact="true"/>
+          <break/>
+        </do_if>
+
+        <!-- Rebuild blockers from the accepted waypoint to the target.
+             First iteration consumed scan-provided blocking_stations directly; only later route
+             state is recomputed against all sector enemy stations. -->
+        <set_value name="$approach_current_blockers" exact="[]"/>
+        <set_value name="$approach_dx" exact="$approach_target_pos.x - $approach_current_pos.x"/>
+        <set_value name="$approach_dy" exact="$approach_target_pos.y - $approach_current_pos.y"/>
+        <set_value name="$approach_dz" exact="$approach_target_pos.z - $approach_current_pos.z"/>
+        <set_value name="$approach_line_len" exact="[$approach_current_pos.distanceto.{$approach_target_pos}, 1m].max"/>
+        <set_value name="$approach_line_len_sq" exact="$approach_line_len * $approach_line_len"/>
+
+        <do_all exact="$sector_enemy_stations.count" counter="$approach_station_i">
+          <set_value name="$approach_station" exact="$sector_enemy_stations.{$approach_station_i}"/>
+          <!-- No sense to check the primary target -->
+          <do_if value="$approach_station == $primary_target">
+            <continue/>
+          </do_if>
+
+          <!-- Endpoint and prefilter clearance -->
+          <set_value name="$approach_waypoint_clearance_radius" exact="$approach_fleet_clearance + ($approach_station.size / 2.0)"/>
+
+          <!-- Early cheap prefilter: skip stations that cannot affect this waypoint -
+               waypoint was already checked against this station just a few lines ago
+               with "break" for a waypoint with that waypoint invalidation, BUT
+               it does mean exactly that it can be safely skipped here -->
+          <do_if value="$approach_station.distanceto.{$approach_current_pos} le $approach_waypoint_clearance_radius">
+            <continue/>
+          </do_if>
+
+          <!-- Early cheap prefilter: skip stations that are out of the route leg bubble -
+               they cannot be blockers in any case. This assumes that this route leg is from
+               current_pos (last waypoint) till the target - if no blockers are found at all this will be true,
+               otherwise it's still ok to remove stations that cannot affect -->
+          <do_if value="$approach_station.distanceto.{$approach_current_pos} gt ($approach_line_len + $approach_waypoint_clearance_radius)">
+            <continue/>
+          </do_if>
+
+          <create_position name="$approach_station_pos" space="this.ship.sector" object="$approach_station"/>
+          <set_value name="$approach_bx" exact="$approach_station_pos.x - $approach_current_pos.x"/>
+          <set_value name="$approach_by" exact="$approach_station_pos.y - $approach_current_pos.y"/>
+          <set_value name="$approach_bz" exact="$approach_station_pos.z - $approach_current_pos.z"/>
+          <set_value name="$approach_dot" exact="$approach_bx * $approach_dx + $approach_by * $approach_dy + $approach_bz * $approach_dz"/>
+
+          <!-- Target-near stations are ignored only if they are outside the target-end approach cone.
+               The cone apex is the target, opening at 45 degrees towards the approach: a station stays
+               a blocker only while its perpendicular distance to the route is below its remaining
+               distance to the target - "ahead on final approach", not "beside the target cluster". -->
+          <do_if value="$approach_station.distanceto.{$primary_target} le $approach_waypoint_clearance_radius">
+            <set_value name="$approach_target_cone_station_dist_sq" exact="$approach_bx * $approach_bx + $approach_by * $approach_by + $approach_bz * $approach_bz"/>
+            <set_value name="$approach_target_cone_perp_dist_sq" exact="$approach_target_cone_station_dist_sq - (($approach_dot * $approach_dot) / $approach_line_len_sq)"/>
+            <set_value name="$approach_target_cone_distance_from_target" exact="$approach_line_len - ($approach_dot / $approach_line_len)"/>
+            <set_value name="$approach_target_cone_radius" exact="[$approach_target_cone_distance_from_target, 0m].max"/>
+            <set_value name="$approach_target_cone_radius_sq" exact="$approach_target_cone_radius * $approach_target_cone_radius"/>
+            <do_if value="$approach_target_cone_distance_from_target le 0m
+                      or $approach_target_cone_distance_from_target gt $approach_waypoint_clearance_radius
+                      or $approach_target_cone_perp_dist_sq gt $approach_target_cone_radius_sq">
+              <continue/>
+            </do_if>
+          </do_if>
+
+          <!-- Projection must fall on the route segment, not behind current waypoint or past target. -->
+          <do_if value="$approach_dot le 0 or $approach_dot gt $approach_line_len_sq">
+            <continue/>
+          </do_if>
+
+          <!-- Stations cannot move into the route, so use fixed corridor radius plus station bounds. -->
+          <set_value name="$approach_station_radius" exact="$approach_route_corridor + ($approach_station.size / 2.0)"/>
+          <set_value name="$approach_station_radius_sq" exact="$approach_station_radius * $approach_station_radius"/>
+          <set_value name="$approach_station_dist_sq" exact="$approach_bx * $approach_bx + $approach_by * $approach_by + $approach_bz * $approach_bz"/>
+          <set_value name="$approach_perp_dist_sq" exact="$approach_station_dist_sq - (($approach_dot * $approach_dot) / $approach_line_len_sq)"/>
+
+          <!-- Perpendicular distance (normale) to route line must fit inside the corridor. -->
+          <do_if value="$approach_perp_dist_sq le $approach_station_radius_sq">
+            <append_to_list name="$approach_current_blockers" exact="$approach_station"/>
+          </do_if>
+        </do_all>
+
+        <!-- No blockers from the current waypoint - break the waypoint-seeking loop -->
+        <do_if value="$approach_current_blockers.count == 0">
+          <break/>
+        </do_if>
+      </do_while>
+
+      <!-- approach_route_failed variable is not used at this lib revision.
+           Maybe later it would be used with some debug log line or for some other logic -->
+
+      <label name="skip_waypoints_construction"/>
+
+      <!-- For station targets - issue a move order to approach near that station.
+           Do not issue move order with station as a target - it produces weird move destination -->
+      <do_if value="$primary_target.isclass.station">
+        <set_value name="$station_approach_anchor" exact="$primary_target"/>
+        <set_value name="$station_approach_distance" exact="(this.ship.currentradarrange + ($primary_target.size / 2.0)) * 0.99"/>
+        <create_position name="$station_approach_anchor_pos" space="this.ship.sector" object="$station_approach_anchor"/>
+        <set_value name="$station_approach_distance_from_current" exact="[$station_approach_anchor.distanceto.{$approach_current_pos}, 1m].max"/>
+        <set_value name="$station_approach_proportion" exact="[$station_approach_distance / $station_approach_distance_from_current, 1.0].min"/>
+        <create_position name="$station_approach_pos" space="this.ship.sector"
+                         x="$station_approach_anchor_pos.x + (($approach_current_pos.x - $station_approach_anchor_pos.x) * $station_approach_proportion)"
+                         y="$station_approach_anchor_pos.y + (($approach_current_pos.y - $station_approach_anchor_pos.y) * $station_approach_proportion)"
+                         z="$station_approach_anchor_pos.z + (($approach_current_pos.z - $station_approach_anchor_pos.z) * $station_approach_proportion)"/>
+        <create_order id="'MoveGeneric'" object="this.ship" immediate="true">
+          <param name="destination" value="$station_approach_anchor.sector"/>
+          <param name="position" value="$station_approach_pos"/>
+          <param name="stopondetect" value="$primary_target"/>
+        </create_order>
+      </do_if>
+      <do_else> <!-- value="$primary_target.isclass.ship" because we have only stations and ships as targets -->
+        <!-- If the approach is mutual, then stop on detect would stop the final MoveGeneric order
+             and attack order would take action. -->
+        <create_order id="'MoveGeneric'" object="this.ship" immediate="true">
+          <param name="destination" value="$primary_target"/>
+          <param name="pursuetargets" value="true"/>
+          <param name="stopondetect" value="$primary_target"/>
+          <param name="vas_cl_issued_by_cl" value="true"/>
+        </create_order>
+      </do_else>
+
+      <!-- Immediate orders execute stack-style here: Attack was issued first, the final leg above
+           was issued second, and these fixed detour legs are issued from end to start so the first
+           waypoint becomes the next order to execute. -->
+      <do_all exact="$approach_waypoints.count" counter="$approach_order_i">
+        <set_value name="$approach_waypoint_index" exact="$approach_waypoints.count + 1 - $approach_order_i"/>
+        <create_order id="'MoveGeneric'" object="this.ship" immediate="true">
+          <param name="destination" value="this.ship.sector"/>
+          <param name="position" value="$approach_waypoints.{$approach_waypoint_index}"/>
+          <param name="stopondetect" value="$primary_target"/>
+        </create_order>
+      </do_all>
+    </actions>
+  </attention>
+</aiscript>
