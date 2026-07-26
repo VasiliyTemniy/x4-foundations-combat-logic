@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8" ?>
 <diff>
-  <!-- Internal flags used by Enhanced Patrol AI attacks that deliberately override vanilla mayattack checks. -->
+  <!-- Internal flags used by Combat Logic attacks that deliberately override vanilla mayattack checks. -->
   <!-- FRAGILITY - NONE: adds internal params to the Attack order definition.
        INJECTION FAIL IMPACT: CL-only pursuit clamping and mayattack override propagation will not receive
                               their flags, but vanilla order flow and most parts of this mod remains intact. -->
