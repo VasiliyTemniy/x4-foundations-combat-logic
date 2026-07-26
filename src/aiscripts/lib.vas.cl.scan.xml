@@ -328,12 +328,7 @@
                this commander is relevant to this scan. If the targetship's commander IS VISIBLE -
                then this targetship is NOT VFF. Otherwise, commander is not visible, we consider this
                targetship as a local VFF from the point of view of the scanner -->
-          <do_if value="@global.$vas_cl_shipvisibility_cache.{this.ship.owner}.{$targetship.commander}">
-            <continue/>
-          </do_if>
-          <set_value name="$can_see_target" exact="global.$vas_cl_shipvisibility_cache.{this.ship.owner}.{$targetship.commander}.$value"/>
-          <!-- Only if there's a commander ship and it's visible - we consider this targetship as not VFF -->
-          <do_if value="$can_see_target">
+          <do_if value="@global.$vas_cl_shipvisibility_cache.{this.ship.owner}.{$targetship.commander}.$value">
             <continue/>
           </do_if>
         </do_if>
