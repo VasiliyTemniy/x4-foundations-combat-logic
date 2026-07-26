@@ -21,6 +21,8 @@
     <param name="visibility_all_seeing" default="false" comment="Treat every hostile sector object as visible"/>
     <param name="visibility_allied_vision" default="true" comment="Let friendly objects contribute their vision"/>
     <param name="potential_ally_combatant_force_coefficient" default="0.5" comment="Weight of nearby friendly VFFs that run a CL-capable order, are hostile to the target, but have not committed yet, when checking attack initiation thresholds - they may pick another target, so they count discounted"/>
+    <param name="potential_ally_owners" default="null" comment="Optional faction whitelist for potential ally combatants: null (or empty) = any friendly VFF counts, otherwise only VFFs owned by a faction in this list. Lets a consumer whose own logic is faction-gated exclude VFFs that will never actually join the fight. Committed allies are unaffected - they are already fighting"/>
+    <param name="excluded_ally_ships" default="null" comment="Optional ship blacklist for potential ally combatants: null (or empty) = no check, otherwise any VFF present in this list is skipped. Lets a consumer exclude individually opted-out ships. Committed allies are unaffected - they are already fighting"/>
     <param name="force_estimation_deviation" default="0.1" comment="Fog-of-war randomizer: every force estimate is multiplied by a random factor in [1 - deviation, 1 + deviation] (lower bound clamped to 0.1), rerolled right before each comparison"/>
     <param name="ship_join_threshold" default="0.1" comment="Minimum committed-friendly-force / target-force ratio required before this ship joins an attack on a ship (VFF) that is already under way"/>
     <param name="ship_overcommit_limit" default="10" comment="Stop joining a ship target once committed friendly force exceeds this multiple of the target's force, so one target does not soak the whole sector"/>
@@ -821,13 +823,16 @@
         </do_if>
 
         <!-- Potential ally combatants - friendly VFFs on a CL-capable order, hostile to this target,
-             not committed yet - are discounted because they may choose another target first. -->
+             not committed yet - are discounted because they may choose another target first.
+             The owner whitelist / ship blacklist keep VFFs that can never join out of the sum. -->
         <do_all exact="$friendly_sector_vffs.count" counter="$j">
           <set_value name="$potential_ally_vff" exact="$friendly_sector_vffs.{$j}"/>
           <do_if value="$potential_ally_vff == this.ship
                     or not $potential_ally_vff.ishostileto.{$targetstation}
                     or not $potential_ally_vff.owner.hasrelation.enemy.{$targetstation.owner}
-                    or not $cl_order_ids.indexof.{@$potential_ally_vff.order.id}">
+                    or not $cl_order_ids.indexof.{@$potential_ally_vff.order.id}
+                    or (@$potential_ally_owners.count and not $potential_ally_owners.indexof.{$potential_ally_vff.owner})
+                    or (@$excluded_ally_ships.count and $excluded_ally_ships.indexof.{$potential_ally_vff})">
             <continue/>
           </do_if>
           <do_if value="not @global.$vas_cl_fleetforce_cache.{$potential_ally_vff.owner}.{$potential_ally_vff}">
@@ -978,13 +983,16 @@
         </do_if>
 
         <!-- Potential ally combatants - friendly VFFs on a CL-capable order, hostile to this target,
-             not committed yet - are discounted because they may choose another target first. -->
+             not committed yet - are discounted because they may choose another target first.
+             The owner whitelist / ship blacklist keep VFFs that can never join out of the sum. -->
         <do_all exact="$friendly_sector_vffs.count" counter="$j">
           <set_value name="$potential_ally_vff" exact="$friendly_sector_vffs.{$j}"/>
           <do_if value="$potential_ally_vff == this.ship
                     or not $potential_ally_vff.ishostileto.{$target_vff}
                     or not $potential_ally_vff.owner.hasrelation.enemy.{$target_vff.owner}
-                    or not $cl_order_ids.indexof.{@$potential_ally_vff.order.id}">
+                    or not $cl_order_ids.indexof.{@$potential_ally_vff.order.id}
+                    or (@$potential_ally_owners.count and not $potential_ally_owners.indexof.{$potential_ally_vff.owner})
+                    or (@$excluded_ally_ships.count and $excluded_ally_ships.indexof.{$potential_ally_vff})">
             <continue/>
           </do_if>
           <do_if value="not @global.$vas_cl_fleetforce_cache.{$potential_ally_vff.owner}.{$potential_ally_vff}">
